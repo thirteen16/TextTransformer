@@ -1,0 +1,11 @@
+# Local build output
+*.exe
+*.pdb
+bin/
+obj/
+
+# Editor files
+.vs/
+.vscode/
+*.user
+*.suo
