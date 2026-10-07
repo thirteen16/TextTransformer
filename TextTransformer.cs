@@ -287,7 +287,7 @@ namespace TextTransformer
             Icon = appIcon;
             Text = "文本转换助手"; FormBorderStyle = FormBorderStyle.FixedDialog;
             AutoScaleMode = AutoScaleMode.None; AutoSize = false;
-            MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterScreen;
+            MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.Manual;
             Font = new Font("Microsoft YaHei UI", 10);
             BackColor = Color.FromArgb(247, 247, 249);
             float scale;
@@ -306,7 +306,7 @@ namespace TextTransformer
             }
             var menu = new ContextMenuStrip();
             menu.Font = new Font("Microsoft YaHei UI", 10, FontStyle.Regular, GraphicsUnit.Point);
-            menu.Items.Add("使用说明", null, delegate { Show(); WindowState = FormWindowState.Normal; Activate(); });
+            menu.Items.Add("使用说明", null, delegate { ShowHelp(); });
             var startupItem = new ToolStripMenuItem("开机自启");
             string startupError = null;
             try { startupItem.Checked = Startup.IsEnabled(); }
@@ -322,7 +322,7 @@ namespace TextTransformer
             menu.Items.Add(shortcutItem);
             menu.Items.Add("退出", null, delegate { quitting = true; Close(); });
             tray = new NotifyIcon { Icon = trayIcon, Text = "文本转换助手", Visible = true, ContextMenuStrip = menu };
-            tray.DoubleClick += delegate { Show(); Activate(); };
+            tray.DoubleClick += delegate { ShowHelp(); };
             if (startupError != null) ReportError(startupError);
             hookProc = OnKey;
             hook = Native.SetWindowsHookEx(13, hookProc, Native.GetModuleHandle(null), 0);
@@ -341,6 +341,20 @@ namespace TextTransformer
         {
             tray.ShowBalloonTip(3000, "文本转换助手", message, ToolTipIcon.Warning);
         }
+        void CenterHelp()
+        {
+            PerformLayout();
+            Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(area.Left + Math.Max(0, (area.Width - Width) / 2),
+                area.Top + Math.Max(0, (area.Height - Height) / 2));
+        }
+        void ShowHelp()
+        {
+            WindowState = FormWindowState.Normal;
+            CenterHelp();
+            Show();
+            Activate();
+        }
         protected override void SetVisibleCore(bool value)
         {
             if (startHidden && value) {
@@ -348,6 +362,7 @@ namespace TextTransformer
                 if (!IsHandleCreated) CreateHandle();
                 value = false;
             }
+            if (value) CenterHelp();
             base.SetVisibleCore(value);
         }
         IntPtr OnKey(int code, IntPtr wParam, IntPtr lParam)
