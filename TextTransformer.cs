@@ -21,6 +21,18 @@ namespace TextTransformer
         public static string Apply(string text, ActionKind kind)
         {
             if (kind == ActionKind.LettersOnly) {
+                // Repository confirmation text must retain the complete owner/name.
+                const string repository = @"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+";
+                var quoted = Regex.Matches(text, "\"(?<repo>" + repository + ")\"|“(?<repo>" + repository + ")”");
+                if (quoted.Count == 1) return quoted[0].Groups["repo"].Value;
+                string trimmed = text.Trim();
+                if (Regex.IsMatch(trimmed, @"\A" + repository + @"\z")) return trimmed;
+                var parts = Regex.Matches(trimmed, @"\S+");
+                if (parts.Count >= 3) {
+                    int start = parts[1].Index;
+                    int end = parts[parts.Count - 2].Index + parts[parts.Count - 2].Length;
+                    text = trimmed.Substring(start, end - start);
+                }
                 var letters = new StringBuilder();
                 foreach (char c in text) if (IsLetter(c)) letters.Append(c);
                 return letters.ToString();
@@ -121,33 +133,13 @@ namespace TextTransformer
         public void Reset() { held.Clear(); current = previous = 0; valid = false; }
     }
 
-    sealed class RecentPinyin
+    static class PinyinText
     {
-        public string Text { get; private set; }
-        public IntPtr Window { get; private set; }
-        public IntPtr Focus { get; private set; }
-        public bool Overflow { get; private set; }
-        public RecentPinyin() { Reset(); }
-        public void Reset() { Text = ""; Window = Focus = IntPtr.Zero; Overflow = false; }
         public static bool Valid(string text) { return text != null && text.Length <= 64 && Regex.IsMatch(text, @"\A[a-zA-Z]+(?:'[a-zA-Z]+)*'?\z"); }
-        public void Feed(int key, bool modified, bool shift, bool caps, IntPtr window, IntPtr focus)
+        public static string Suffix(string prefix)
         {
-            if (key == 0xA4) return;
-            if (modified) { Reset(); return; }
-            if (window != Window || focus != Focus) Reset();
-            if (key >= 0x41 && key <= 0x5A && !caps) {
-                Append(((char)(shift ? key : key + 32)).ToString(), window, focus);
-            } else if (key == 0xDE && !shift && Text.Length != 0) {
-                Append("'", window, focus);
-            } else if (key == 0x08 && !shift) {
-                if (Text.Length != 0) Text = Text.Substring(0, Text.Length - 1);
-            } else if (key != 0x0D && key != 0x10 && key != 0xA0 && key != 0xA1) Reset();
-        }
-        void Append(string letter, IntPtr window, IntPtr focus)
-        {
-            Window = window; Focus = focus;
-            if (Text.Length >= 64) { Overflow = true; return; }
-            Text += letter;
+            var match = Regex.Match(prefix ?? "", @"[a-zA-Z']+\z");
+            return match.Success && Valid(match.Value) ? match.Value : "";
         }
     }
 
@@ -170,25 +162,19 @@ namespace TextTransformer
             original = ranges[0].Clone();
         }
         public string SelectedText { get { return original.GetText(-1); } }
-        public void CheckSelection(string expected)
+        public string AutomaticText()
         {
-            var ranges = pattern.GetSelection();
-            if (ranges.Length != 1 || ranges[0].GetText(-1) != expected)
-                throw new InvalidOperationException("选区已改变，已取消拼音恢复。");
+            var prefix = original.Clone();
+            prefix.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -65);
+            string text = prefix.GetText(-1);
+            return PinyinText.Suffix(text);
         }
-        public void SelectRecent(string expected)
-        {
-            var range = original.Clone();
-            if (range.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -expected.Length) != -expected.Length || range.GetText(-1) != expected)
-                throw new InvalidOperationException("光标前文字与最近输入不一致，未替换任何文字。");
-            range.Select();
-        }
-        public void RestoreCaret() { original.Select(); }
     }
 
     static class Native
     {
         public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [StructLayout(LayoutKind.Sequential)] public struct Keyboard { public uint vkCode, scanCode, flags, time; public UIntPtr extra; }
         [StructLayout(LayoutKind.Sequential)] public struct MouseHookData { public int x, y; public uint data, flags, time; public UIntPtr extra; }
         [StructLayout(LayoutKind.Sequential)] public struct KeyboardInput { public ushort vk, scan; public uint flags, time; public UIntPtr extra; }
@@ -222,6 +208,14 @@ namespace TextTransformer
         [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, Input[] inputs, int size);
         public static bool Down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
         public static void Key(ushort key) { SendKeys(new ushort[] { key, key }, new uint[] { 0, 2 }); }
+        public static void SelectPrevious(int count)
+        {
+            var keys = new List<ushort>(); var flags = new List<uint>();
+            keys.Add(0x10); flags.Add(0);
+            for (int i = 0; i < count; i++) { keys.Add(0x25); flags.Add(0); keys.Add(0x25); flags.Add(2); }
+            keys.Add(0x10); flags.Add(2);
+            SendKeys(keys.ToArray(), flags.ToArray());
+        }
         static void SendKeys(ushort[] keys, uint[] flags)
         {
             var inputs = new Input[keys.Length];
@@ -269,10 +263,8 @@ namespace TextTransformer
     sealed class MainForm : Form
     {
         readonly TapDetector detector = new TapDetector();
-        readonly RecentPinyin recent = new RecentPinyin();
         readonly Native.HookProc hookProc;
         readonly Native.HookProc mouseProc;
-        readonly System.Windows.Forms.Timer focusTimer;
         readonly NotifyIcon tray;
         bool enabled = true;
         readonly Icon appIcon;
@@ -294,9 +286,10 @@ namespace TextTransformer
             Text = "使用说明 — 文本转换助手"; ClientSize = new Size(600, 265); FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen; Font = new Font("Microsoft YaHei UI", 10);
             var help = new Label { Location = new Point(24, 20), Size = new Size(552, 230), Text =
-                "双击 CapsLock：英文字母全大写；已全大写则转为小写。\r\n双击左 Shift：只保留英文字母，删除其他字符。\r\n双击右 Shift：句首大写，其余英文字母小写，中文标点转英文。\r\n前三项：有选区时处理选区，否则处理输入框全文。\r\n\r\n双击左 Alt：恢复拼音候选，不自动选字。\r\n有选区时只恢复选中的拼音；无选区时恢复刚输入的字母。\r\n请在误输字母末尾直接触发，不要先点击或移动光标。\r\n已有英文与拼音连续紧挨着时，请选中拼音后恢复。" };
+                "双击 CapsLock：英文字母全大写；已全大写则转为小写。\r\n双击左 Shift：提取仓库名；查词去掉首尾词，只留中间字母。\r\n双击右 Shift：句首大写，其余英文字母小写，中文标点转英文。\r\n前三项：有选区时处理选区，否则处理输入框全文。\r\n\r\n双击左 Alt：恢复拼音候选，不自动选字。\r\n有选区时只恢复选中的拼音；无选区时恢复光标前末尾的拼音字母。\r\n把光标放在误输字母末尾，再双击左 Alt。\r\n已有英文与拼音连续紧挨着时，请选中拼音后恢复。" };
             Controls.Add(help);
             var menu = new ContextMenuStrip();
+            menu.Font = new Font("Microsoft YaHei UI", 10, FontStyle.Regular, GraphicsUnit.Point);
             menu.Items.Add("使用说明", null, delegate { Show(); WindowState = FormWindowState.Normal; Activate(); });
             var startupItem = new ToolStripMenuItem("开机自启");
             string startupError = null;
@@ -309,7 +302,7 @@ namespace TextTransformer
             };
             menu.Items.Add(startupItem);
             var shortcutItem = new ToolStripMenuItem("使用快捷键") { Checked = enabled };
-            shortcutItem.Click += delegate { enabled = !enabled; shortcutItem.Checked = enabled; detector.Reset(); recent.Reset(); altAlone = false; };
+            shortcutItem.Click += delegate { enabled = !enabled; shortcutItem.Checked = enabled; detector.Reset(); altAlone = false; };
             menu.Items.Add(shortcutItem);
             menu.Items.Add("退出", null, delegate { quitting = true; Close(); });
             tray = new NotifyIcon { Icon = appIcon, Text = "文本转换助手", Visible = true, ContextMenuStrip = menu };
@@ -324,11 +317,6 @@ namespace TextTransformer
                 Native.UnhookWindowsHookEx(hook); hook = IntPtr.Zero;
                 throw new InvalidOperationException("注册鼠标监听失败，无法保护拼音恢复范围。");
             }
-            focusTimer = new System.Windows.Forms.Timer { Interval = 100 };
-            focusTimer.Tick += delegate {
-                if (!busy && recent.Text.Length != 0 && (Native.GetForegroundWindow() != recent.Window || Native.FocusedControl(recent.Window) != recent.Focus)) recent.Reset();
-            };
-            focusTimer.Start();
             FormClosing += delegate(object sender, FormClosingEventArgs e) {
                 if (!quitting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
             };
@@ -362,8 +350,6 @@ namespace TextTransformer
                     if (down) {
                         if (key == 0xA4) altAlone = !Native.Down(0x11) && !Native.Down(0x10) && !Native.Down(0x5B) && !Native.Down(0x5C);
                         else altAlone = false;
-                        recent.Feed(key, Native.Down(0x11) || Native.Down(0x12) || Native.Down(0x5B) || Native.Down(0x5C), Native.Down(0x10), (Native.GetKeyState(0x14) & 1) != 0,
-                            Native.GetForegroundWindow(), Native.FocusedControl(Native.GetForegroundWindow()));
                     }
                     if (!down && key == 0xA4 && altAlone) {
                         try { Native.Key(0xE8); } catch (Exception ex) { ReportError(ex.Message); }
@@ -390,7 +376,7 @@ namespace TextTransformer
             int message = wParam.ToInt32();
             if (code >= 0 && (message == 0x201 || message == 0x204 || message == 0x207 || message == 0x20A || message == 0x20E || message == 0x20B)) {
                 var data = (Native.MouseHookData)Marshal.PtrToStructure(lParam, typeof(Native.MouseHookData));
-                if ((data.flags & 1) == 0) { recent.Reset(); detector.Reset(); altAlone = false; if (busy) interrupted = true; }
+                if ((data.flags & 1) == 0) { detector.Reset(); altAlone = false; if (busy) interrupted = true; }
             }
             return Native.CallNextHookEx(mouseHook, code, wParam, lParam);
         }
@@ -449,6 +435,9 @@ namespace TextTransformer
             expectedFocus = control;
             PinyinSelection selection = null;
             bool temporarySelection = false;
+            DataObject backup = null;
+            bool saved = false;
+            uint ownedSequence = 0;
             try {
                 await Task.Delay(40); CheckTarget(target);
                 if (target == Handle) return;
@@ -458,14 +447,18 @@ namespace TextTransformer
                 selection = new PinyinSelection(); expectedElement = selection.Element;
                 string selected = selection.SelectedText;
                 bool automatic = selected.Length == 0;
-                string pinyin = automatic ? recent.Text : selected;
-                if (automatic && (recent.Overflow || recent.Window != target || recent.Focus != control || !RecentPinyin.Valid(pinyin)))
-                    throw new InvalidOperationException("没有可恢复的最近输入；也可以选中拼音后双击左 Alt。");
-                if (!RecentPinyin.Valid(pinyin)) throw new InvalidOperationException("请仅选中拼音字母和英文单引号，每次最多 64 个字符。");
+                string pinyin = automatic ? selection.AutomaticText() : selected;
+                if (automatic && pinyin.Length == 0)
+                    throw new InvalidOperationException("光标前没有可恢复的拼音字母；可以选中拼音后双击左 Alt。");
+                if (!PinyinText.Valid(pinyin)) throw new InvalidOperationException("请仅选中拼音字母和英文单引号，每次最多 64 个字符。");
                 CheckTarget(target); Native.EnsureChinese(control);
-                await Task.Delay(80); CheckTarget(target); selection.CheckSelection(selected);
-                if (automatic) { selection.SelectRecent(pinyin); temporarySelection = true; }
-                CheckTarget(target); selection.CheckSelection(pinyin);
+                await Task.Delay(80); CheckTarget(target);
+                backup = BackupClipboard(); saved = true;
+                if (automatic) { Native.SelectPrevious(pinyin.Length); temporarySelection = true; await Task.Delay(60); }
+                string actual = await CopyText(target);
+                ownedSequence = Native.GetClipboardSequenceNumber();
+                if (!String.Equals(actual, pinyin, StringComparison.Ordinal))
+                    throw new InvalidOperationException("实际选中的文字与待恢复拼音不一致，未替换任何文字。");
                 foreach (char letter in pinyin.ToLowerInvariant()) {
                     CheckTarget(target);
                     Native.Key(letter == '\'' ? (ushort)0xDE : (ushort)Char.ToUpperInvariant(letter));
@@ -475,11 +468,16 @@ namespace TextTransformer
                 // Send virtual keys only: no Unicode paste, Space or Enter.
             } catch (Exception ex) {
                 if (temporarySelection && Native.GetForegroundWindow() == target && Native.FocusedControl(target) == control) {
-                    try { if (Automation.Compare(expectedElement, AutomationElement.FocusedElement)) selection.RestoreCaret(); } catch { }
+                    try { if (Automation.Compare(expectedElement, AutomationElement.FocusedElement)) Native.Key(0x27); } catch { }
                 }
                 ReportError(ex.Message);
             } finally {
-                expectedElement = null; recent.Reset(); detector.Reset(); busy = false;
+                try {
+                    if (saved && ownedSequence != 0 && Native.GetClipboardSequenceNumber() == ownedSequence) {
+                        if (backup == null) Clipboard.Clear(); else Clipboard.SetDataObject(backup, true, 5, 40);
+                    }
+                } catch { ReportError("拼音恢复已结束，但剪贴板恢复失败。"); }
+                expectedElement = null; detector.Reset(); busy = false;
             }
         }
         async Task ConvertTarget(IntPtr target, ActionKind kind, IntPtr control = default(IntPtr))
@@ -502,6 +500,13 @@ namespace TextTransformer
                 }
                 if (String.IsNullOrEmpty(original)) return;
                 string result = Transform.Apply(original, kind);
+                if (kind == ActionKind.LettersOnly && !EditableFocus() && result.Length > 0) {
+                    CheckTarget(target);
+                    Clipboard.SetText(result);
+                    saved = false;
+                    tray.ShowBalloonTip(2000, "文本转换助手", "已复制提取结果，可以直接粘贴。", ToolTipIcon.Info);
+                    return;
+                }
                 if (result == original) return;
                 await Task.Delay(80); CheckTarget(target);
                 // Empty text cannot be pasted; Delete removes exactly the selected text.
@@ -518,14 +523,14 @@ namespace TextTransformer
                         if (backup == null) Clipboard.Clear(); else Clipboard.SetDataObject(backup, true, 5, 40);
                     }
                 } catch { ReportError("转换已结束，但剪贴板恢复失败。"); }
-                detector.Reset(); recent.Reset(); busy = false;
+                detector.Reset(); busy = false;
             }
         }
         protected override void Dispose(bool disposing)
         {
             if (hook != IntPtr.Zero) { Native.UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
             if (mouseHook != IntPtr.Zero) { Native.UnhookWindowsHookEx(mouseHook); mouseHook = IntPtr.Zero; }
-            if (disposing) { if (focusTimer != null) focusTimer.Dispose(); tray.ContextMenuStrip.Dispose(); tray.Dispose(); appIcon.Dispose(); }
+            if (disposing) { tray.ContextMenuStrip.Dispose(); tray.Dispose(); appIcon.Dispose(); }
             base.Dispose(disposing);
         }
     }
@@ -540,6 +545,7 @@ namespace TextTransformer
                 return;
             }
             bool created;
+            Native.SetProcessDPIAware();
             using (var mutex = new Mutex(true, "Local\\TextTransformer.Desktop", out created)) {
                 if (!created) { MessageBox.Show("程序已运行，请在系统托盘中打开。", "文本转换助手"); return; }
                 Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
@@ -554,8 +560,14 @@ namespace TextTransformer
             Require(Transform.Apply("ABC", ActionKind.ToggleCase) == "abc", "Lowercase conversion regression");
             Require(Transform.Apply("a中B!123", ActionKind.LettersOnly) == "aB", "Letters-only regression");
             Require(Transform.Apply("hELLO。wORLD！", ActionKind.SentenceCase) == "Hello.World!", "Sentence/punctuation regression");
-            foreach (string value in new[] { "nihao", "NIHAO", "xi'an", "nihao'" }) Require(RecentPinyin.Valid(value), "Valid pinyin rejected");
-            foreach (string value in new[] { "", "你好nihao", "hello nihao", "nihao\n", "abc123", "'abc", "a''b", new string('a', 65) }) Require(!RecentPinyin.Valid(value), "Unsafe pinyin accepted");
+            foreach (string value in new[] { "nihao", "NIHAO", "xi'an", "nihao'" }) Require(PinyinText.Valid(value), "Valid pinyin rejected");
+            foreach (string value in new[] { "", "你好nihao", "hello nihao", "nihao\n", "abc123", "'abc", "a''b", new string('a', 65) }) Require(!PinyinText.Valid(value), "Unsafe pinyin accepted");
+            Require(PinyinText.Suffix("已有中文，English!nihaoshijie") == "nihaoshijie", "Recover only the ASCII suffix of mixed content");
+            Require(PinyinText.Suffix("前文\r\nxi'an") == "xi'an", "Multiline/apostrophe suffix");
+            Require(PinyinText.Suffix("nihao，") == "" && PinyinText.Suffix("nihao ") == "", "Do not recover letters behind a boundary");
+            Require(PinyinText.Suffix(new string('a', 65)) == "", "Do not truncate an oversized suffix");
+            Require(PinyinText.Suffix("hello nihao") == "nihao", "Preserve an existing English word");
+            Require(PinyinText.Suffix("abc''def") == "", "Reject malformed apostrophe runs");
             var taps = new TapDetector();
             Require(!taps.Feed(0xA4, true, 0, false).HasValue, "First Alt down");
             Require(!taps.Feed(0xA4, false, 60, false).HasValue, "Single Alt tap");
@@ -570,26 +582,8 @@ namespace TextTransformer
                 taps.Reset(); taps.Feed(key, true, 0, false); taps.Feed(key, false, 50, false); taps.Feed(key, true, 100, false);
                 Require(taps.Feed(key, false, 150, false) == (key == 0x14 ? ActionKind.ToggleCase : key == 0xA0 ? ActionKind.LettersOnly : ActionKind.SentenceCase), "Existing tap shortcut regression");
             }
-            var recent = new RecentPinyin();
-            IntPtr window = new IntPtr(10), focus = new IntPtr(20);
-            foreach (char letter in "HELLO") recent.Feed(letter, false, false, false, window, focus);
-            recent.Feed(0x20, false, false, false, window, focus);
-            foreach (char letter in "NIHAO") recent.Feed(letter, false, false, false, window, focus);
-            Require(recent.Text == "nihao", "Existing English before boundary must remain outside recovery");
-            recent.Feed(0xA4, false, false, false, window, focus);
-            recent.Feed(0x0D, false, false, false, window, focus);
-            Require(recent.Text == "nihao", "Commit/trigger keys must preserve the recent run");
-            recent.Feed(0x08, false, false, false, window, focus);
-            Require(recent.Text == "niha", "Backspace tracking");
-            recent.Feed(0x4E, false, false, false, window, new IntPtr(21));
-            Require(recent.Text == "n", "Changing control must reset tracking");
-            recent.Reset();
-            for (int i = 0; i < 66; i++) recent.Feed(0x41, false, false, false, window, focus);
-            recent.Feed(0x08, false, false, false, window, focus);
-            Require(recent.Overflow, "Overflow must remain unsafe even after Backspace");
-            recent.Feed(0x25, false, false, false, window, focus);
-            Require(recent.Text.Length == 0 && !recent.Overflow, "Navigation must reset tracking");
             Require(Marshal.SizeOf(typeof(Native.Input)) == (IntPtr.Size == 8 ? 40 : 28), "Native SendInput layout");
         }
     }
 }
+
