@@ -268,6 +268,7 @@ namespace TextTransformer
         readonly NotifyIcon tray;
         bool enabled = true;
         readonly Icon appIcon;
+        readonly Icon trayIcon;
         bool startHidden;
         IntPtr hook, mouseHook;
         bool busy, quitting;
@@ -282,12 +283,27 @@ namespace TextTransformer
                 if (stream == null) throw new InvalidOperationException("程序图标资源缺失，请重新编译。");
                 using (var icon = new Icon(stream)) appIcon = (Icon)icon.Clone();
             }
+            trayIcon = new Icon(appIcon, SystemInformation.SmallIconSize);
             Icon = appIcon;
-            Text = "使用说明 — 文本转换助手"; ClientSize = new Size(600, 265); FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen; Font = new Font("Microsoft YaHei UI", 10);
-            var help = new Label { Location = new Point(24, 20), Size = new Size(552, 230), Text =
-                "双击 CapsLock：英文字母全大写；已全大写则转为小写。\r\n双击左 Shift：提取仓库名；查词去掉首尾词，只留中间字母。\r\n双击右 Shift：句首大写，其余英文字母小写，中文标点转英文。\r\n前三项：有选区时处理选区，否则处理输入框全文。\r\n\r\n双击左 Alt：恢复拼音候选，不自动选字。\r\n有选区时只恢复选中的拼音；无选区时恢复光标前末尾的拼音字母。\r\n把光标放在误输字母末尾，再双击左 Alt。\r\n已有英文与拼音连续紧挨着时，请选中拼音后恢复。" };
-            Controls.Add(help);
+            Text = "文本转换助手"; FormBorderStyle = FormBorderStyle.FixedDialog;
+            AutoScaleMode = AutoScaleMode.None; AutoSize = false;
+            MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterScreen;
+            Font = new Font("Microsoft YaHei UI", 10);
+            BackColor = Color.FromArgb(247, 247, 249);
+            float scale;
+            using (var graphics = CreateGraphics()) scale = graphics.DpiX / 96f;
+            Func<int, int> px = value => (int)Math.Round(value * scale);
+            ClientSize = new Size(px(480), px(280));
+            var heading = new Label { Text = "双击快捷键", Font = new Font(Font.FontFamily, 14, FontStyle.Bold), ForeColor = Color.FromArgb(40, 43, 49), Bounds = new Rectangle(px(24), px(20), px(432), px(32)) };
+            Controls.Add(heading);
+            string[] keyNames = { "左 Alt", "CapsLock", "左 Shift", "右 Shift" };
+            string[] actions = { "恢复拼音候选", "切换英文大小写", "提取仓库名 / 查词", "句首大写 / 标点转换" };
+            for (int i = 0; i < keyNames.Length; i++) {
+                var row = new Panel { BackColor = Color.White, Bounds = new Rectangle(px(24), px(66 + i * 48), px(432), px(42)) };
+                var keyLabel = new Label { Text = keyNames[i], TextAlign = ContentAlignment.MiddleCenter, BackColor = Color.FromArgb(255, 239, 220), ForeColor = Color.FromArgb(182, 78, 8), Font = new Font(Font, FontStyle.Bold), Bounds = new Rectangle(px(10), px(7), px(112), px(28)) };
+                var actionLabel = new Label { Text = actions[i], TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(55, 58, 64), Bounds = new Rectangle(px(140), 0, px(280), px(42)) };
+                row.Controls.Add(keyLabel); row.Controls.Add(actionLabel); Controls.Add(row);
+            }
             var menu = new ContextMenuStrip();
             menu.Font = new Font("Microsoft YaHei UI", 10, FontStyle.Regular, GraphicsUnit.Point);
             menu.Items.Add("使用说明", null, delegate { Show(); WindowState = FormWindowState.Normal; Activate(); });
@@ -305,7 +321,7 @@ namespace TextTransformer
             shortcutItem.Click += delegate { enabled = !enabled; shortcutItem.Checked = enabled; detector.Reset(); altAlone = false; };
             menu.Items.Add(shortcutItem);
             menu.Items.Add("退出", null, delegate { quitting = true; Close(); });
-            tray = new NotifyIcon { Icon = appIcon, Text = "文本转换助手", Visible = true, ContextMenuStrip = menu };
+            tray = new NotifyIcon { Icon = trayIcon, Text = "文本转换助手", Visible = true, ContextMenuStrip = menu };
             tray.DoubleClick += delegate { Show(); Activate(); };
             if (startupError != null) ReportError(startupError);
             hookProc = OnKey;
@@ -530,7 +546,7 @@ namespace TextTransformer
         {
             if (hook != IntPtr.Zero) { Native.UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
             if (mouseHook != IntPtr.Zero) { Native.UnhookWindowsHookEx(mouseHook); mouseHook = IntPtr.Zero; }
-            if (disposing) { tray.ContextMenuStrip.Dispose(); tray.Dispose(); appIcon.Dispose(); }
+            if (disposing) { tray.ContextMenuStrip.Dispose(); tray.Dispose(); trayIcon.Dispose(); appIcon.Dispose(); }
             base.Dispose(disposing);
         }
     }
