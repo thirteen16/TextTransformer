@@ -21,17 +21,13 @@ namespace TextTransformer
         public static string Apply(string text, ActionKind kind)
         {
             if (kind == ActionKind.LettersOnly) {
-                // Repository confirmation text must retain the complete owner/name.
-                const string repository = @"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+";
-                var quoted = Regex.Matches(text, "\"(?<repo>" + repository + ")\"|“(?<repo>" + repository + ")”");
-                if (quoted.Count == 1) return quoted[0].Groups["repo"].Value;
-                string trimmed = text.Trim();
-                if (Regex.IsMatch(trimmed, @"\A" + repository + @"\z")) return trimmed;
-                var parts = Regex.Matches(trimmed, @"\S+");
-                if (parts.Count >= 3) {
-                    int start = parts[1].Index;
-                    int end = parts[parts.Count - 2].Index + parts[parts.Count - 2].Length;
-                    text = trimmed.Substring(start, end - start);
+                // Keep delimited content intact; otherwise keep ASCII letters only.
+                var quoted = Regex.Match(text, @"""(?<middle>[^""]*)""|“(?<middle>[^”]*)”|‘(?<middle>[^’]*)’|'(?<middle>[^']*)'|「(?<middle>[^」]*)」|『(?<middle>[^』]*)』");
+                if (quoted.Success) return quoted.Groups["middle"].Value;
+                int firstSpace = text.IndexOf(' ');
+                int lastSpace = text.LastIndexOf(' ');
+                if (firstSpace >= 0 && lastSpace > firstSpace) {
+                    return text.Substring(firstSpace + 1, lastSpace - firstSpace - 1);
                 }
                 var letters = new StringBuilder();
                 foreach (char c in text) if (IsLetter(c)) letters.Append(c);
@@ -297,7 +293,7 @@ namespace TextTransformer
             var heading = new Label { Text = "双击快捷键", Font = new Font(Font.FontFamily, 14, FontStyle.Bold), ForeColor = Color.FromArgb(40, 43, 49), Bounds = new Rectangle(px(24), px(20), px(432), px(32)) };
             Controls.Add(heading);
             string[] keyNames = { "左 Alt", "CapsLock", "左 Shift", "右 Shift" };
-            string[] actions = { "恢复拼音候选", "切换英文大小写", "提取仓库名 / 查词", "句首大写 / 标点转换" };
+            string[] actions = { "恢复拼音候选", "切换英文大小写", "提取中间内容 / 查词", "句首大写 / 标点转换" };
             for (int i = 0; i < keyNames.Length; i++) {
                 var row = new Panel { BackColor = Color.White, Bounds = new Rectangle(px(24), px(66 + i * 48), px(432), px(42)) };
                 var keyLabel = new Label { Text = keyNames[i], TextAlign = ContentAlignment.MiddleCenter, BackColor = Color.FromArgb(255, 239, 220), ForeColor = Color.FromArgb(182, 78, 8), Font = new Font(Font, FontStyle.Bold), Bounds = new Rectangle(px(10), px(7), px(112), px(28)) };
@@ -321,7 +317,7 @@ namespace TextTransformer
             shortcutItem.Click += delegate { enabled = !enabled; shortcutItem.Checked = enabled; detector.Reset(); altAlone = false; };
             menu.Items.Add(shortcutItem);
             menu.Items.Add("退出", null, delegate { quitting = true; Close(); });
-            tray = new NotifyIcon { Icon = trayIcon, Text = "文本转换助手", Visible = true, ContextMenuStrip = menu };
+            tray = new NotifyIcon { Icon = trayIcon, Text = "TextTransformer", Visible = true, ContextMenuStrip = menu };
             tray.DoubleClick += delegate { ShowHelp(); };
             if (startupError != null) ReportError(startupError);
             hookProc = OnKey;
