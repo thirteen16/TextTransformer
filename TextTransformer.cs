@@ -19,17 +19,24 @@ namespace TextTransformer
 
     static class Transform
     {
+        public static bool TryMiddle(string text, out string middle)
+        {
+            var quoted = Regex.Match(text, @"""(?<middle>[^""]*)""|“(?<middle>[^”]*)”|‘(?<middle>[^’]*)’|'(?<middle>[^']*)'|「(?<middle>[^」]*)」|『(?<middle>[^』]*)』");
+            if (quoted.Success) { middle = quoted.Groups["middle"].Value; return true; }
+            int firstSpace = text.IndexOf(' '), lastSpace = text.LastIndexOf(' ');
+            if (firstSpace >= 0 && lastSpace > firstSpace) {
+                middle = text.Substring(firstSpace + 1, lastSpace - firstSpace - 1);
+                return true;
+            }
+            middle = null;
+            return false;
+        }
         public static string Apply(string text, ActionKind kind)
         {
             if (kind == ActionKind.LettersOnly) {
                 // Keep delimited content intact; otherwise keep ASCII letters only.
-                var quoted = Regex.Match(text, @"""(?<middle>[^""]*)""|“(?<middle>[^”]*)”|‘(?<middle>[^’]*)’|'(?<middle>[^']*)'|「(?<middle>[^」]*)」|『(?<middle>[^』]*)』");
-                if (quoted.Success) return quoted.Groups["middle"].Value;
-                int firstSpace = text.IndexOf(' ');
-                int lastSpace = text.LastIndexOf(' ');
-                if (firstSpace >= 0 && lastSpace > firstSpace) {
-                    return text.Substring(firstSpace + 1, lastSpace - firstSpace - 1);
-                }
+                string middle;
+                if (TryMiddle(text, out middle)) return middle;
                 var letters = new StringBuilder();
                 foreach (char c in text) if (IsLetter(c)) letters.Append(c);
                 return letters.ToString();
@@ -157,6 +164,19 @@ namespace TextTransformer
     static class SentenceText
     {
         public const int MaximumLength = 1024;
+        public static string Suffix(string text, ActionKind kind)
+        {
+            if (kind != ActionKind.LettersOnly) return Suffix(text);
+            // Extraction needs spaces and Chinese quotes, but never another line
+            // or a tab-separated table cell. Inspect only the prefix at the caret.
+            int boundary = text.LastIndexOfAny(new[] { '\r', '\n', '\t' });
+            string line = text.Substring(boundary + 1);
+            string middle;
+            if (Transform.TryMiddle(line, out middle)) return line;
+            int start = line.Length;
+            while (start > 0 && line[start - 1] >= '!' && line[start - 1] <= '~') start--;
+            return line.Substring(start);
+        }
         public static string Suffix(string text)
         {
             int start = text.Length;
@@ -630,14 +650,14 @@ namespace TextTransformer
             // This ASCII estimate is always checked against the actual copied text.
             return Regex.Matches(text, @"[A-Za-z_]+(?:'[A-Za-z_]+)*|[^A-Za-z_]+").Count;
         }
-        static SentenceSelectionPlan PlanSentenceSelection(IntPtr control)
+        static SentenceSelectionPlan PlanSentenceSelection(IntPtr control, ActionKind kind)
         {
             try {
                 Native.EditSnapshot snapshot;
                 if (Native.TryReadEdit(control, out snapshot)) {
                     if (snapshot.Start != snapshot.End) return null;
                     int start = Math.Max(0, snapshot.Start - SentenceText.MaximumLength - 1);
-                    string text = SentenceText.Suffix(snapshot.Text.Substring(start, snapshot.Start - start));
+                    string text = SentenceText.Suffix(snapshot.Text.Substring(start, snapshot.Start - start), kind);
                     return new SentenceSelectionPlan {
                         Text = text,
                         Select = delegate { Native.SelectEditText(control, snapshot.Start - text.Length, snapshot.End); },
@@ -663,12 +683,12 @@ namespace TextTransformer
                         int moved = prefix.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -SentenceText.MaximumLength - 1);
                         string prefixText = prefix.GetText(-1);
                         if (moved != 0 && prefixText.Length == 0) return null;
-                        string text = SentenceText.Suffix(prefixText);
+                        string text = SentenceText.Suffix(prefixText, kind);
                         var selection = caret.Clone();
                         selection.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -text.Length);
                         if (selection.GetText(-1) != text) return null;
                         int words = 0;
-                        if (text.Length > 32 && text.Length <= SentenceText.MaximumLength) {
+                        if (kind != ActionKind.LettersOnly && text.Length > 32 && text.Length <= SentenceText.MaximumLength) {
                             words = SentenceWordCount(text);
                         }
                         return new SentenceSelectionPlan {
@@ -689,14 +709,14 @@ namespace TextTransformer
             } catch (Exception) { }
             return null;
         }
-        async Task<string> SelectPlannedSentence(IntPtr target, Action<bool> selectionChanged, Action<uint> copied)
+        async Task<string> SelectPlannedSentence(IntPtr target, ActionKind kind, Action<bool> selectionChanged, Action<uint> copied)
         {
-            var plan = PlanSentenceSelection(expectedFocus);
+            var plan = PlanSentenceSelection(expectedFocus, kind);
             if (plan == null) return null;
             if (plan.Text.Length > SentenceText.MaximumLength)
                 throw new InvalidOperationException("连续文本超过 1024 字符，请手动选择要转换的部分。");
             if (plan.Text.Length == 0) return "";
-            if (Transform.Apply(plan.Text, ActionKind.SentenceCase) == plan.Text) return plan.Text;
+            if (Transform.Apply(plan.Text, kind) == plan.Text) return plan.Text;
             for (int attempt = 0; attempt < 2; attempt++) {
                 CheckTarget(target);
                 bool selected = false;
@@ -826,12 +846,14 @@ namespace TextTransformer
             }
             ReportError("剪贴板仍被占用，无法恢复原内容；文字转换不会因此撤销。");
         }
-        async Task<string> SelectSentenceSuffix(IntPtr target, Action<bool> selectionChanged, Action<uint> copied)
+        async Task<string> SelectSentenceSuffix(IntPtr target, ActionKind kind, Action<bool> selectionChanged, Action<uint> copied)
         {
             // Read a bounded prefix once, then select exactly the computed suffix.
             // Clipboard verification still guards both native and accessibility plans.
-            string planned = await SelectPlannedSentence(target, selectionChanged, copied);
+            string planned = await SelectPlannedSentence(target, kind, selectionChanged, copied);
             if (planned != null) return planned;
+            if (kind == ActionKind.LettersOnly)
+                throw new InvalidOperationException("无法确认当前行的提取范围，请手动选中要查词或提取的文字后重试。");
             string previous = "";
             Func<string> reader = CreateSelectionReader(expectedFocus);
             int requested = 0;
@@ -976,22 +998,17 @@ namespace TextTransformer
                 await Task.Delay(40); CheckTarget(target);
                 if (target == Handle) return;
                 if (Native.Down(0x10) || Native.Down(0x11) || Native.Down(0x12)) return;
+                // Some editors copy a whole line or document without a selection.
+                // Confirm the range before copying; never fall back to Ctrl+A.
+                bool? selectionState = ReadSelectionState(expectedFocus);
+                if (!selectionState.HasValue)
+                    throw new InvalidOperationException("无法确认文本选区，请在支持选区读取的编辑器中选中文字后重试。");
                 backup = await BackupForOperation(target); saved = true;
                 string original = null;
-                if (kind == ActionKind.SentenceCase) {
-                    bool? selectionState = ReadSelectionState(expectedFocus);
-                    if (selectionState != false)
-                        original = await CopyText(target, 2, text => !String.IsNullOrEmpty(text), sequence => ownedSequence = sequence, 4);
-                    if (String.IsNullOrEmpty(original))
-                        original = await SelectSentenceSuffix(target, selected => temporarySelection = selected, sequence => ownedSequence = sequence);
-                } else {
+                if (selectionState.Value) {
                     original = await CopyText(target, 3, text => !String.IsNullOrEmpty(text), sequence => ownedSequence = sequence);
-                }
-                if (String.IsNullOrEmpty(original) && kind != ActionKind.SentenceCase) {
-                    if (!EditableFocus()) throw new InvalidOperationException("未发现文本选区或可编辑输入框，请先选中文字。");
-                    CheckTarget(target); Native.Shortcut(0x41); await Task.Delay(70);
-                    original = await CopyText(target, 3, text => !String.IsNullOrEmpty(text), sequence => ownedSequence = sequence);
-                }
+                } else
+                    original = await SelectSentenceSuffix(target, kind, selected => temporarySelection = selected, sequence => ownedSequence = sequence);
                 if (String.IsNullOrEmpty(original)) return;
                 string result = Transform.Apply(original, kind);
                 if (kind == ActionKind.LettersOnly && !EditableFocus() && result.Length > 0) {
