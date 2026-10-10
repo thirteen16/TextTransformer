@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -153,6 +154,23 @@ namespace TextTransformer
         }
     }
 
+    static class SentenceText
+    {
+        public const int MaximumLength = 1024;
+        public static string Suffix(string text)
+        {
+            int start = text.Length;
+            while (start > 0) {
+                char c = text[start - 1];
+                bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+                bool symbol = c >= '!' && c <= '~' && !(c >= '0' && c <= '9');
+                if (!letter && !symbol) break;
+                start--;
+            }
+            return text.Substring(start);
+        }
+    }
+
     // Use actual text ranges. Never treat an editor's copy-whole-line behavior
     // as a selection, and never select the entire input for pinyin recovery.
     sealed class PinyinSelection
@@ -196,6 +214,8 @@ namespace TextTransformer
 
     static class Native
     {
+        [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")]
+        static extern uint WindowProcess(IntPtr window, out uint processId);
         public sealed class EditSnapshot { public string Text; public int Start, End; }
         public static bool IsQtWindow(IntPtr window)
         {
@@ -242,6 +262,10 @@ namespace TextTransformer
                 return true;
             } finally { Marshal.FreeHGlobal(textBuffer); Marshal.FreeHGlobal(offsets); }
         }
+        public static void SelectEditText(IntPtr window, int start, int end)
+        {
+            ReadEditMessage(window, 0xB1, new IntPtr(start), new IntPtr(end)); // EM_SETSEL
+        }
         public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [StructLayout(LayoutKind.Sequential)] public struct Keyboard { public uint vkCode, scanCode, flags, time; public UIntPtr extra; }
@@ -274,6 +298,12 @@ namespace TextTransformer
         [DllImport("imm32.dll")] static extern IntPtr ImmGetDefaultIMEWnd(IntPtr window);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr command, IntPtr value, uint flags, uint timeout, out UIntPtr result);
         [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+        [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
+        public static bool OwnsClipboard()
+        {
+            uint processId;
+            return WindowProcess(GetClipboardOwner(), out processId) != 0 && processId == (uint)Process.GetCurrentProcess().Id;
+        }
         [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, Input[] inputs, int size);
         public static bool Down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
         public static void Key(ushort key) { SendKeys(new ushort[] { key, key }, new uint[] { 0, 2 }); }
@@ -289,12 +319,37 @@ namespace TextTransformer
         {
             SendKeys(new ushort[] { 0x10, 0x24, 0x24, 0x10 }, new uint[] { 0, 0, 2, 2 });
         }
+        public static void RetractPreviousSelection(int count = 1)
+        {
+            var keys = new List<ushort>(); var flags = new List<uint>();
+            keys.Add(0x10); flags.Add(0);
+            for (int i = 0; i < count; i++) { keys.Add(0x27); flags.Add(0); keys.Add(0x27); flags.Add(2); }
+            keys.Add(0x10); flags.Add(2);
+            SendKeys(keys.ToArray(), flags.ToArray());
+        }
+        public static void SelectPreviousWords(int count)
+        {
+            var keys = new List<ushort>(); var flags = new List<uint>();
+            keys.Add(0x11); flags.Add(0); keys.Add(0x10); flags.Add(0);
+            for (int i = 0; i < count; i++) { keys.Add(0x25); flags.Add(0); keys.Add(0x25); flags.Add(2); }
+            keys.Add(0x10); flags.Add(2); keys.Add(0x11); flags.Add(2);
+            SendKeys(keys.ToArray(), flags.ToArray());
+        }
         static void SendKeys(ushort[] keys, uint[] flags)
         {
             var inputs = new Input[keys.Length];
-            for (int i = 0; i < keys.Length; i++) { inputs[i].type = 1; inputs[i].data.keyboard.vk = keys[i]; inputs[i].data.keyboard.flags = flags[i]; }
-            if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != inputs.Length)
-                throw new InvalidOperationException("无法发送按键，请检查目标程序权限。");
+            for (int i = 0; i < keys.Length; i++) {
+                inputs[i].type = 1; inputs[i].data.keyboard.vk = keys[i];
+                inputs[i].data.keyboard.flags = flags[i] | (keys[i] >= 0x21 && keys[i] <= 0x2E ? 1u : 0u);
+            }
+            // Keep each injection below the system's event-buffer limits. Modifier
+            // down/up events remain in order across batches; no per-character waits.
+            for (int start = 0; start < inputs.Length; start += 128) {
+                int count = Math.Min(128, inputs.Length - start);
+                var batch = new Input[count]; Array.Copy(inputs, start, batch, 0, count);
+                if (SendInput((uint)count, batch, Marshal.SizeOf(typeof(Input))) != count)
+                    throw new InvalidOperationException("无法发送按键，请检查目标程序权限。");
+            }
         }
         static ulong ImeControl(IntPtr window, uint command, int value)
         {
@@ -343,6 +398,7 @@ namespace TextTransformer
         readonly Native.HookProc hookProc;
         readonly Native.HookProc mouseProc;
         readonly NotifyIcon tray;
+        string ownedClipboardText;
         bool enabled = true;
         readonly Icon appIcon;
         readonly Icon trayIcon;
@@ -502,6 +558,195 @@ namespace TextTransformer
                 return false;
             } catch { return false; }
         }
+        static bool? ReadSelectionState(IntPtr control)
+        {
+            try {
+                Native.EditSnapshot native;
+                if (Native.TryReadEdit(control, out native)) return native.Start != native.End;
+                var element = AutomationElement.FocusedElement;
+                for (int i = 0; element != null && i < 6; i++) {
+                    object value;
+                    if (element.TryGetCurrentPattern(TextPattern.Pattern, out value)) {
+                        var ranges = ((TextPattern)value).GetSelection();
+                        foreach (var range in ranges)
+                            if (range.CompareEndpoints(TextPatternRangeEndpoint.Start, range, TextPatternRangeEndpoint.End) != 0) return true;
+                        return false;
+                    }
+                    element = TreeWalker.ControlViewWalker.GetParent(element);
+                }
+            } catch (ElementNotAvailableException) { }
+              catch (InvalidOperationException) { }
+              catch (ExternalException) { }
+            return null;
+        }
+        static string ReadFocusedText(IntPtr control)
+        {
+            try {
+                Native.EditSnapshot native;
+                if (Native.TryReadEdit(control, out native)) return native.Text;
+                var element = AutomationElement.FocusedElement;
+                for (int i = 0; element != null && i < 6; i++) {
+                    object value;
+                    if (element.TryGetCurrentPattern(ValuePattern.Pattern, out value)) return ((ValuePattern)value).Current.Value;
+                    if (element.TryGetCurrentPattern(TextPattern.Pattern, out value)) return ((TextPattern)value).DocumentRange.GetText(1048576);
+                    element = TreeWalker.ControlViewWalker.GetParent(element);
+                }
+            } catch (Exception) { }
+            return null;
+        }
+        static Func<string> CreateSelectionReader(IntPtr control)
+        {
+            try {
+                Native.EditSnapshot snapshot;
+                if (Native.TryReadEdit(control, out snapshot)) return delegate {
+                    Native.EditSnapshot current;
+                    if (!Native.TryReadEdit(control, out current)) return null;
+                    return current.Text.Substring(current.Start, current.End - current.Start);
+                };
+                var element = AutomationElement.FocusedElement;
+                for (int i = 0; element != null && i < 6; i++) {
+                    object value;
+                    if (element.TryGetCurrentPattern(TextPattern.Pattern, out value)) {
+                        var pattern = (TextPattern)value;
+                        return delegate {
+                            var ranges = pattern.GetSelection();
+                            return ranges.Length == 1 ? ranges[0].GetText(SentenceText.MaximumLength + 16) : null;
+                        };
+                    }
+                    element = TreeWalker.ControlViewWalker.GetParent(element);
+                }
+            } catch (Exception) { }
+            return null;
+        }
+        sealed class SentenceSelectionPlan
+        {
+            public string Text;
+            public Action Select, Restore;
+            public Func<bool> AtOriginalCaret;
+        }
+        static int SentenceWordCount(string text)
+        {
+            // Keyboard word boundaries can differ from UIA's TextUnit.Word.
+            // This ASCII estimate is always checked against the actual copied text.
+            return Regex.Matches(text, @"[A-Za-z_]+(?:'[A-Za-z_]+)*|[^A-Za-z_]+").Count;
+        }
+        static SentenceSelectionPlan PlanSentenceSelection(IntPtr control)
+        {
+            try {
+                Native.EditSnapshot snapshot;
+                if (Native.TryReadEdit(control, out snapshot)) {
+                    if (snapshot.Start != snapshot.End) return null;
+                    int start = Math.Max(0, snapshot.Start - SentenceText.MaximumLength - 1);
+                    string text = SentenceText.Suffix(snapshot.Text.Substring(start, snapshot.Start - start));
+                    return new SentenceSelectionPlan {
+                        Text = text,
+                        Select = delegate { Native.SelectEditText(control, snapshot.Start - text.Length, snapshot.End); },
+                        Restore = delegate { Native.SelectEditText(control, snapshot.Start, snapshot.End); },
+                        AtOriginalCaret = delegate {
+                            Native.EditSnapshot current;
+                            return Native.TryReadEdit(control, out current) && current.Start == snapshot.Start
+                                && current.End == snapshot.End && current.Text == snapshot.Text;
+                        }
+                    };
+                }
+                var element = AutomationElement.FocusedElement;
+                for (int i = 0; element != null && i < 6; i++) {
+                    object value;
+                    if (element.Current.IsPassword) return null;
+                    if (element.TryGetCurrentPattern(TextPattern.Pattern, out value)) {
+                        var pattern = (TextPattern)value;
+                        var ranges = pattern.GetSelection();
+                        if (ranges.Length != 1) return null;
+                        var caret = ranges[0].Clone();
+                        if (caret.CompareEndpoints(TextPatternRangeEndpoint.Start, caret, TextPatternRangeEndpoint.End) != 0) return null;
+                        var prefix = caret.Clone();
+                        int moved = prefix.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -SentenceText.MaximumLength - 1);
+                        string prefixText = prefix.GetText(-1);
+                        if (moved != 0 && prefixText.Length == 0) return null;
+                        string text = SentenceText.Suffix(prefixText);
+                        var selection = caret.Clone();
+                        selection.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -text.Length);
+                        if (selection.GetText(-1) != text) return null;
+                        int words = 0;
+                        if (text.Length > 32 && text.Length <= SentenceText.MaximumLength) {
+                            words = SentenceWordCount(text);
+                        }
+                        return new SentenceSelectionPlan {
+                            Text = text, Select = delegate {
+                                if (words > 0 && words < text.Length / 2) Native.SelectPreviousWords(words);
+                                else Native.SelectPrevious(text.Length);
+                            }, Restore = delegate { Native.Key(0x27); },
+                            AtOriginalCaret = delegate {
+                                var current = pattern.GetSelection();
+                                return current.Length == 1
+                                    && current[0].CompareEndpoints(TextPatternRangeEndpoint.Start, caret, TextPatternRangeEndpoint.Start) == 0
+                                    && current[0].CompareEndpoints(TextPatternRangeEndpoint.End, caret, TextPatternRangeEndpoint.End) == 0;
+                            }
+                        };
+                    }
+                    element = TreeWalker.ControlViewWalker.GetParent(element);
+                }
+            } catch (Exception) { }
+            return null;
+        }
+        async Task<string> SelectPlannedSentence(IntPtr target, Action<bool> selectionChanged, Action<uint> copied)
+        {
+            var plan = PlanSentenceSelection(expectedFocus);
+            if (plan == null) return null;
+            if (plan.Text.Length > SentenceText.MaximumLength)
+                throw new InvalidOperationException("连续文本超过 1024 字符，请手动选择要转换的部分。");
+            if (plan.Text.Length == 0) return "";
+            if (Transform.Apply(plan.Text, ActionKind.SentenceCase) == plan.Text) return plan.Text;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                CheckTarget(target);
+                bool selected = false;
+                try {
+                    if (attempt == 0) plan.Select();
+                    else Native.SelectPrevious(plan.Text.Length);
+                    selected = true;
+                } catch (Exception) { } // Read-only range APIs may still allow keyboard selection.
+                selectionChanged(true);
+                if (selected) {
+                    // Verify the final range once; no per-character copying.
+                    await Task.Delay(50);
+                    string actual = await CopyText(target, 3, text => text == plan.Text, copied);
+                    if (actual == plan.Text) return actual;
+                }
+                CheckTarget(target);
+                try {
+                    if (!plan.AtOriginalCaret()) { plan.Restore(); await Task.Delay(20); CheckTarget(target); }
+                    if (!plan.AtOriginalCaret()) throw new InvalidOperationException();
+                } catch (Exception) {
+                    throw new InvalidOperationException("无法恢复原光标位置，请手动选中文字后重试。");
+                }
+                selectionChanged(false);
+            }
+            return null;
+        }
+        async Task<string> ReadSentenceSelection(IntPtr target, Func<string> reader, string previous, Action<uint> copied)
+        {
+            if (reader != null) {
+                for (int i = 0; i < 3; i++) {
+                    await Task.Delay(15); CheckTarget(target);
+                    try {
+                        string text = reader();
+                        if (!String.IsNullOrEmpty(text) && text != previous) return text;
+                    } catch (Exception) { break; }
+                }
+            } else await Task.Delay(50);
+            // Missing or stale accessibility data uses the verified clipboard path.
+            return await CopyText(target, 2, text => !String.IsNullOrEmpty(text), copied, 4);
+        }
+        async Task<bool> WaitForPaste(IntPtr target, string before)
+        {
+            if (before == null) { await Task.Delay(1200); return true; }
+            for (int i = 0; i < 40; i++) {
+                await Task.Delay(50); CheckTarget(target);
+                string after = ReadFocusedText(expectedFocus);
+                if (after != null && after != before) return true;
+            }
+            return false;
+        }
         static DataObject BackupClipboard()
         {
             IDataObject original = Clipboard.GetDataObject();
@@ -530,6 +775,7 @@ namespace TextTransformer
                     if (sequence != before) {
                         try {
                             string text = Clipboard.ContainsText() ? Clipboard.GetText() : null;
+                            ownedClipboardText = text;
                             if (accept == null || accept(text)) return text;
                         } catch (ExternalException) { }
                     }
@@ -537,7 +783,7 @@ namespace TextTransformer
             }
             return null;
         }
-        async Task<DataObject> BackupForPinyin(IntPtr target)
+        async Task<DataObject> BackupForOperation(IntPtr target)
         {
             DataObject result = null;
             bool ready = await Compatibility.WaitUntil(delegate {
@@ -546,6 +792,88 @@ namespace TextTransformer
             }, () => CheckTarget(target), 6, 50);
             if (!ready) throw new InvalidOperationException("剪贴板持续被占用，未修改文字，请稍后再试。");
             return result;
+        }
+        async Task RestoreClipboard(DataObject backup, uint ownedSequence)
+        {
+            if (ownedSequence == 0) return;
+            for (int attempt = 0; attempt < 8; attempt++) {
+                uint current = Native.GetClipboardSequenceNumber();
+                if (current != ownedSequence) {
+                    // Delayed rendering can change the sequence while our data remains owner.
+                    bool sameText = false;
+                    try { sameText = ownedClipboardText != null && Clipboard.ContainsText() && Clipboard.GetText() == ownedClipboardText; }
+                    catch (ExternalException) { }
+                    if (!Native.OwnsClipboard() && !sameText) return;
+                    ownedSequence = current;
+                }
+                try {
+                    if (backup == null) Clipboard.Clear();
+                    else if (attempt < 5) Clipboard.SetDataObject(backup, true, 1, 0);
+                    else if (attempt < 7) Clipboard.SetDataObject(backup, false, 1, 0);
+                    else if (backup.ContainsText()) Clipboard.SetText(backup.GetText());
+                    else Clipboard.SetDataObject(backup, false, 1, 0);
+                    if (backup != null && backup.ContainsText() && (!Clipboard.ContainsText() || Clipboard.GetText() != backup.GetText()))
+                        throw new InvalidOperationException("剪贴板文本尚未恢复。");
+                    return;
+                } catch (Exception) {
+                    uint sequence = Native.GetClipboardSequenceNumber();
+                    if (sequence != ownedSequence) {
+                        if (!Native.OwnsClipboard()) return;
+                        ownedSequence = sequence;
+                    }
+                }
+                await Task.Delay(100 + attempt * 50);
+            }
+            ReportError("剪贴板仍被占用，无法恢复原内容；文字转换不会因此撤销。");
+        }
+        async Task<string> SelectSentenceSuffix(IntPtr target, Action<bool> selectionChanged, Action<uint> copied)
+        {
+            // Read a bounded prefix once, then select exactly the computed suffix.
+            // Clipboard verification still guards both native and accessibility plans.
+            string planned = await SelectPlannedSentence(target, selectionChanged, copied);
+            if (planned != null) return planned;
+            string previous = "";
+            Func<string> reader = CreateSelectionReader(expectedFocus);
+            int requested = 0;
+            while (requested < SentenceText.MaximumLength) {
+                // A batch can cross a table cell and change the editor's copy semantics.
+                // Extend one caret step, and retract that same step at the boundary.
+                CheckTarget(target); Native.SelectPrevious(1); selectionChanged(true);
+                requested++;
+                string selected = await ReadSentenceSelection(target, reader, previous, copied);
+                if (selected == null) {
+                    if (previous.Length == 0) {
+                        if (ReadSelectionState(expectedFocus) == false) selectionChanged(false);
+                        return "";
+                    }
+                    throw new InvalidOperationException("无法核对光标前的文字，请手动选中文字后重试。");
+                }
+                if (!selected.EndsWith(previous, StringComparison.Ordinal))
+                    throw new InvalidOperationException("选区内容不稳定，未替换文字。");
+                string suffix = SentenceText.Suffix(selected);
+                if (suffix.Length != selected.Length) {
+                    CheckTarget(target); Native.RetractPreviousSelection();
+                    selectionChanged(previous.Length != 0);
+                    if (previous.Length == 0) return "";
+                    await Task.Delay(50);
+                    string actual = await CopyText(target, 2, text => text == previous, copied, 4);
+                    if (actual != previous) throw new InvalidOperationException("无法核对待转换文字，未替换文字。");
+                    return previous;
+                }
+                if (selected == previous) { // Start of the input was reached.
+                    string actual = await CopyText(target, 2, text => text == previous, copied, 4);
+                    if (actual != previous) throw new InvalidOperationException("无法核对待转换文字，未替换文字。");
+                    return previous;
+                }
+                previous = selected;
+            }
+            throw new InvalidOperationException("连续文本超过 1024 字符，请手动选择要转换的部分。");
+        }
+        async void FinishOperation(DataObject backup, uint sequence, bool saved)
+        {
+            try { if (saved) await RestoreClipboard(backup, sequence); }
+            catch (Exception ex) { ReportError("无法恢复剪贴板：" + ex.Message); }
+            finally { expectedElement = null; ownedClipboardText = null; detector.Reset(); busy = false; }
         }
         async Task<PinyinSelection> AcquireSelection(IntPtr target, IntPtr control)
         {
@@ -587,7 +915,7 @@ namespace TextTransformer
                 if (Native.Down(0x10) || Native.Down(0x11) || Native.Down(0x12)) return;
                 if ((Native.GetKeyState(0x14) & 1) != 0) throw new InvalidOperationException("请先关闭 CapsLock 再恢复拼音。");
                 selection = await AcquireSelection(target, control); expectedElement = selection.Element;
-                backup = await BackupForPinyin(target); saved = true;
+                backup = await BackupForOperation(target); saved = true;
                 bool automatic;
                 string pinyin;
                 if (selection.KeyboardOnly) {
@@ -634,12 +962,7 @@ namespace TextTransformer
                 }
                 ReportError(ex.Message);
             } finally {
-                try {
-                    if (saved && ownedSequence != 0 && Native.GetClipboardSequenceNumber() == ownedSequence) {
-                        if (backup == null) Clipboard.Clear(); else Clipboard.SetDataObject(backup, true, 5, 40);
-                    }
-                } catch { ReportError("拼音恢复已结束，但剪贴板恢复失败。"); }
-                expectedElement = null; detector.Reset(); busy = false;
+                FinishOperation(backup, ownedSequence, saved);
             }
         }
         async Task ConvertTarget(IntPtr target, ActionKind kind, IntPtr control = default(IntPtr))
@@ -647,18 +970,27 @@ namespace TextTransformer
             expectedFocus = control == IntPtr.Zero ? Native.FocusedControl(target) : control;
             DataObject backup = null;
             bool saved = false;
+            bool temporarySelection = false;
             uint ownedSequence = 0;
             try {
                 await Task.Delay(40); CheckTarget(target);
                 if (target == Handle) return;
                 if (Native.Down(0x10) || Native.Down(0x11) || Native.Down(0x12)) return;
-                backup = BackupClipboard(); saved = true;
-                string original = await CopyText(target);
-                ownedSequence = Native.GetClipboardSequenceNumber();
-                if (String.IsNullOrEmpty(original)) {
+                backup = await BackupForOperation(target); saved = true;
+                string original = null;
+                if (kind == ActionKind.SentenceCase) {
+                    bool? selectionState = ReadSelectionState(expectedFocus);
+                    if (selectionState != false)
+                        original = await CopyText(target, 2, text => !String.IsNullOrEmpty(text), sequence => ownedSequence = sequence, 4);
+                    if (String.IsNullOrEmpty(original))
+                        original = await SelectSentenceSuffix(target, selected => temporarySelection = selected, sequence => ownedSequence = sequence);
+                } else {
+                    original = await CopyText(target, 3, text => !String.IsNullOrEmpty(text), sequence => ownedSequence = sequence);
+                }
+                if (String.IsNullOrEmpty(original) && kind != ActionKind.SentenceCase) {
                     if (!EditableFocus()) throw new InvalidOperationException("未发现文本选区或可编辑输入框，请先选中文字。");
                     CheckTarget(target); Native.Shortcut(0x41); await Task.Delay(70);
-                    original = await CopyText(target); ownedSequence = Native.GetClipboardSequenceNumber();
+                    original = await CopyText(target, 3, text => !String.IsNullOrEmpty(text), sequence => ownedSequence = sequence);
                 }
                 if (String.IsNullOrEmpty(original)) return;
                 string result = Transform.Apply(original, kind);
@@ -671,21 +1003,25 @@ namespace TextTransformer
                 }
                 if (result == original) return;
                 await Task.Delay(80); CheckTarget(target);
+                string beforePaste = ReadFocusedText(expectedFocus);
                 // Empty text cannot be pasted; Delete removes exactly the selected text.
-                if (result.Length == 0) Native.DeleteSelection();
+                if (result.Length == 0) { Native.DeleteSelection(); temporarySelection = false; }
                 else {
                     Clipboard.SetText(result); ownedSequence = Native.GetClipboardSequenceNumber();
+                    ownedClipboardText = result;
                     Native.Shortcut(0x56);
+                    temporarySelection = false;
                 }
-                await Task.Delay(600);
+                if (!await WaitForPaste(target, beforePaste)) {
+                    saved = false; // A late paste must still receive the converted text.
+                    ReportError("未确认输入框已接收替换，转换结果已留在剪贴板，可手动粘贴。");
+                } else await Task.Delay(150);
             } catch (Exception ex) { ReportError(ex.Message); }
             finally {
-                try {
-                    if (saved && ownedSequence != 0 && Native.GetClipboardSequenceNumber() == ownedSequence) {
-                        if (backup == null) Clipboard.Clear(); else Clipboard.SetDataObject(backup, true, 5, 40);
-                    }
-                } catch { ReportError("转换已结束，但剪贴板恢复失败。"); }
-                detector.Reset(); busy = false;
+                if (temporarySelection && !interrupted && Native.GetForegroundWindow() == target && Native.FocusedControl(target) == expectedFocus) {
+                    try { Native.Key(0x27); } catch { }
+                }
+                FinishOperation(backup, ownedSequence, saved);
             }
         }
         protected override void Dispose(bool disposing)
