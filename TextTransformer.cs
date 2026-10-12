@@ -22,11 +22,21 @@ namespace TextTransformer
         public static bool TryMiddle(string text, out string middle)
         {
             var quoted = Regex.Match(text, @"""(?<middle>[^""]*)""|“(?<middle>[^”]*)”|‘(?<middle>[^’]*)’|'(?<middle>[^']*)'|「(?<middle>[^」]*)」|『(?<middle>[^』]*)』");
-            if (quoted.Success) { middle = quoted.Groups["middle"].Value; return true; }
-            int firstSpace = text.IndexOf(' '), lastSpace = text.LastIndexOf(' ');
-            if (firstSpace >= 0 && lastSpace > firstSpace) {
-                middle = text.Substring(firstSpace + 1, lastSpace - firstSpace - 1);
+            if (quoted.Success && !String.IsNullOrWhiteSpace(quoted.Groups["middle"].Value)) {
+                middle = quoted.Groups["middle"].Value;
                 return true;
+            }
+            // Space-pair extraction is only meaningful in pure English text.
+            // A run is one separator; padding around one token is not a pair.
+            string content = text.Trim('\r', '\n');
+            var spaces = Regex.Matches(content, @"[^\S\r\n]+");
+            bool paddingOnly = spaces.Count == 2 && spaces[0].Index == 0
+                && spaces[1].Index + spaces[1].Length == content.Length;
+            if (Regex.IsMatch(content, @"\A[A-Za-z\s]+\z") && spaces.Count >= 2 && !paddingOnly) {
+                int start = spaces[spaces.Count - 2].Index + spaces[spaces.Count - 2].Length;
+                int end = spaces[spaces.Count - 1].Index;
+                middle = content.Substring(start, end - start);
+                if (!String.IsNullOrWhiteSpace(middle)) return true;
             }
             middle = null;
             return false;
@@ -37,6 +47,12 @@ namespace TextTransformer
                 // Keep delimited content intact; otherwise keep ASCII letters only.
                 string middle;
                 if (TryMiddle(text, out middle)) return middle;
+                foreach (char c in text) {
+                    if (Char.IsLetter(c) && !IsLetter(c)) {
+                        var nearest = Regex.Match(text, @"[A-Za-z]+", RegexOptions.RightToLeft);
+                        return nearest.Success ? nearest.Value : "";
+                    }
+                }
                 var letters = new StringBuilder();
                 foreach (char c in text) if (IsLetter(c)) letters.Append(c);
                 return letters.ToString();
@@ -115,7 +131,7 @@ namespace TextTransformer
         bool valid;
         public ActionKind? Feed(int key, bool down, long now, bool modifierHeld)
         {
-            bool target = key == 0x14 || key == 0xA0 || key == 0xA1 || key == 0xA4;
+            bool target = key == 0x14 || key == 0xA5 || key == 0xA1 || key == 0xA4;
             if (!target) { previous = 0; valid = false; return null; }
             if (down) {
                 if (!held.Add(key)) return null;
@@ -130,7 +146,7 @@ namespace TextTransformer
             if (!tap) { previous = 0; return null; }
             if (previous == key && now - released <= 400) {
                 previous = 0;
-                return key == 0x14 ? ActionKind.ToggleCase : key == 0xA0 ? ActionKind.LettersOnly : key == 0xA1 ? ActionKind.SentenceCase : ActionKind.RestorePinyin;
+                return key == 0x14 ? ActionKind.ToggleCase : key == 0xA5 ? ActionKind.LettersOnly : key == 0xA1 ? ActionKind.SentenceCase : ActionKind.RestorePinyin;
             }
             previous = key; released = now; return null;
         }
@@ -167,15 +183,11 @@ namespace TextTransformer
         public static string Suffix(string text, ActionKind kind)
         {
             if (kind != ActionKind.LettersOnly) return Suffix(text);
-            // Extraction needs spaces and Chinese quotes, but never another line
-            // or a tab-separated table cell. Inspect only the prefix at the caret.
+            // Inspect only the current line prefix, never a previous line or
+            // a tab-separated table cell.
             int boundary = text.LastIndexOfAny(new[] { '\r', '\n', '\t' });
             string line = text.Substring(boundary + 1);
-            string middle;
-            if (Transform.TryMiddle(line, out middle)) return line;
-            int start = line.Length;
-            while (start > 0 && line[start - 1] >= '!' && line[start - 1] <= '~') start--;
-            return line.Substring(start);
+            return line;
         }
         public static string Suffix(string text)
         {
@@ -188,6 +200,29 @@ namespace TextTransformer
                 start--;
             }
             return text.Substring(start);
+        }
+    }
+
+    static class LookupLine
+    {
+        public static string Before(string text, int caret)
+        {
+            caret = Math.Max(0, Math.Min(caret, text.Length));
+            int start = caret;
+            while (start > 0 && text[start - 1] != '\r' && text[start - 1] != '\n') start--;
+            return text.Substring(start, caret - start);
+        }
+    }
+
+    static class PlainText
+    {
+        public static string NormalizeNewlines(string text)
+        {
+            return text == null ? null : text.Replace("\r\n", "\n").Replace('\r', '\n');
+        }
+        public static bool Same(string first, string second)
+        {
+            return String.Equals(NormalizeNewlines(first), NormalizeNewlines(second), StringComparison.Ordinal);
         }
     }
 
@@ -275,6 +310,13 @@ namespace TextTransformer
                 Marshal.WriteInt32(offsets, 0, -1); Marshal.WriteInt32(offsets, 4, -1);
                 int copied = (int)ReadEditMessage(window, 0xD, new IntPtr((long)length + 1), textBuffer).ToUInt64();
                 string text = Marshal.PtrToStringUni(textBuffer, copied);
+                // RichEdit exposes CRLF via WM_GETTEXT, but EM_GETSEL positions
+                // count each paragraph break as one UTF-16 character.
+                var className = new StringBuilder(256);
+                GetClassName(window, className, className.Capacity);
+                if (className.ToString().StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase)
+                    || className.ToString().StartsWith("WindowsForms10.RichEdit", StringComparison.OrdinalIgnoreCase))
+                    text = PlainText.NormalizeNewlines(text);
                 ReadEditMessage(window, 0xB0, offsets, IntPtr.Add(offsets, 4)); // EM_GETSEL
                 int start = Marshal.ReadInt32(offsets), end = Marshal.ReadInt32(offsets, 4);
                 if (start < 0 || end < start || end > text.Length) throw new InvalidOperationException("无法核对原生输入框的选区，未修改文字。");
@@ -285,6 +327,12 @@ namespace TextTransformer
         public static void SelectEditText(IntPtr window, int start, int end)
         {
             ReadEditMessage(window, 0xB1, new IntPtr(start), new IntPtr(end)); // EM_SETSEL
+        }
+        public static void ReplaceEditSelection(IntPtr window, string text)
+        {
+            IntPtr buffer = Marshal.StringToHGlobalUni(text);
+            try { ReadEditMessage(window, 0xC2, new IntPtr(1), buffer); } // EM_REPLACESEL, undo enabled
+            finally { Marshal.FreeHGlobal(buffer); }
         }
         public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -315,6 +363,54 @@ namespace TextTransformer
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
         [DllImport("user32.dll")] public static extern short GetKeyState(int key);
         [DllImport("user32.dll")] static extern IntPtr GetKeyboardLayout(uint thread);
+        [DllImport("user32.dll")] static extern int GetKeyboardLayoutList(int count, [Out] IntPtr[] layouts);
+        // These are the Microsoft Pinyin TIP and language profile, not just a
+        // Chinese language ID (which also matches third-party input methods).
+        static readonly Guid PinyinService = new Guid("81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E");
+        static readonly Guid PinyinProfile = new Guid("FA550B04-5AD7-411F-A5AC-CA038EC515D7");
+        [StructLayout(LayoutKind.Sequential)] internal struct InputProfile {
+            public uint type;
+            public ushort language;
+            public Guid service, profile, category;
+            public IntPtr substitute;
+            public uint capabilities;
+            public IntPtr layout;
+            public uint flags;
+        }
+        // First three vtable entries of ITfInputProcessorProfileMgr in msctf.h.
+        [ComImport, Guid("71C6E74C-0F28-11D8-A82A-00065B84435C"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface InputProfileManager {
+            [PreserveSig] int ActivateProfile(uint type, ushort language, ref Guid service, ref Guid profile, IntPtr layout, uint flags);
+            [PreserveSig] int DeactivateProfile(uint type, ushort language, ref Guid service, ref Guid profile, IntPtr layout, uint flags);
+            [PreserveSig] int GetProfile(uint type, ushort language, ref Guid service, ref Guid profile, IntPtr layout, out InputProfile result);
+        }
+        static InputProfileManager OpenProfiles()
+        {
+            return (InputProfileManager)Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("33C53A50-F456-4884-B049-85FD643ECFED")));
+        }
+        static IntPtr PinyinLayout(InputProfileManager manager)
+        {
+            Guid service = PinyinService, profile = PinyinProfile;
+            InputProfile info;
+            if (manager.GetProfile(1, 0x0804, ref service, ref profile, IntPtr.Zero, out info) != 0 || (info.flags & 2) == 0)
+                throw new InvalidOperationException("微软拼音未安装或未启用，请在 Windows 输入法设置中添加微软拼音。");
+            if (info.substitute != IntPtr.Zero) return info.substitute;
+            var layouts = new IntPtr[GetKeyboardLayoutList(0, null)];
+            int count = GetKeyboardLayoutList(layouts.Length, layouts);
+            // Modern TSF Pinyin has no substitute HKL. Use its Chinese keyboard
+            // language layout, then activate the exact TIP through TSF.
+            for (int i = 0; i < count; i++) {
+                long value = layouts[i].ToInt64() & 0xFFFFFFFFL;
+                if (value == 0x08040804 || value == 0x00000804) return layouts[i];
+            }
+            throw new InvalidOperationException("无法找到微软拼音的中文键盘布局，请检查 Windows 输入法设置。");
+        }
+        internal static IntPtr ReadPinyinLayout()
+        {
+            var manager = OpenProfiles();
+            try { return PinyinLayout(manager); }
+            finally { Marshal.ReleaseComObject(manager); }
+        }
         [DllImport("imm32.dll")] static extern IntPtr ImmGetDefaultIMEWnd(IntPtr window);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr command, IntPtr value, uint flags, uint timeout, out UIntPtr result);
         [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
@@ -381,12 +477,42 @@ namespace TextTransformer
         public static async Task EnsureChinese(IntPtr focus, Action checkTarget)
         {
             uint thread = GetWindowThreadProcessId(focus, IntPtr.Zero);
-            if (focus == IntPtr.Zero || thread == 0 || (GetKeyboardLayout(thread).ToInt64() & 0xFFFF) != 0x0804)
-                throw new InvalidOperationException("请先用 Win+空格切换到微软拼音。");
-            IntPtr ime = ImmGetDefaultIMEWnd(focus);
-            if (ime == IntPtr.Zero) throw new InvalidOperationException("无法控制此输入框的输入法，请先切到中文模式。");
+            if (focus == IntPtr.Zero || thread == 0)
+                throw new InvalidOperationException("无法确认输入框焦点，已取消拼音恢复。");
+            InputProfileManager manager = null;
+            try {
+                manager = OpenProfiles();
+                IntPtr layout = PinyinLayout(manager);
+                Guid service = PinyinService, profile = PinyinProfile;
+                checkTarget();
+                // Session scope reaches the foreground app, unlike a switch of
+                // this tray app's own thread. Do not enable profiles or set defaults.
+                const uint sessionAndDeferredLanguage = 0x20000004;
+                if (manager.ActivateProfile(1, 0x0804, ref service, ref profile, IntPtr.Zero, sessionAndDeferredLanguage) != 0)
+                    throw new InvalidOperationException("未能自动切换到微软拼音，请检查输入法设置或目标程序权限。");
+                checkTarget();
+                if (GetKeyboardLayout(thread) != layout) {
+                    UIntPtr result;
+                    if (SendMessageTimeout(GetForegroundWindow(), 0x50, UIntPtr.Zero, layout, 2, 250, out result) == IntPtr.Zero)
+                        throw new InvalidOperationException("目标程序未响应输入法切换，未修改文字。");
+                }
+                bool switched = await Compatibility.WaitUntil(() => GetKeyboardLayout(thread) == layout, checkTarget, 12, 60);
+                if (!switched) throw new InvalidOperationException("未能自动切换到微软拼音，未修改文字。");
+                // The initial activation may have been deferred until Chinese
+                // became active. Reapply the exact profile after the language settles.
+                checkTarget();
+                if (manager.ActivateProfile(1, 0x0804, ref service, ref profile, IntPtr.Zero, sessionAndDeferredLanguage) != 0)
+                    throw new InvalidOperationException("未能激活微软拼音，未修改文字。");
+            } catch (COMException) {
+                throw new InvalidOperationException("Windows 输入法服务未能完成切换，请稍后重试。");
+            } finally {
+                if (manager != null) Marshal.ReleaseComObject(manager);
+            }
             bool ready = await Compatibility.WaitUntil(delegate {
                 try {
+                    // Switching profiles can recreate the default IME window.
+                    IntPtr ime = ImmGetDefaultIMEWnd(focus);
+                    if (ime == IntPtr.Zero) return false;
                     int mode = (int)ImeControl(ime, 1, 0);
                     if ((mode & 1) != 0 && ImeControl(ime, 5, 0) != 0) return true;
                     ImeControl(ime, 6, 1);
@@ -449,7 +575,7 @@ namespace TextTransformer
             ClientSize = new Size(px(480), px(280));
             var heading = new Label { Text = "双击快捷键", Font = new Font(Font.FontFamily, 14, FontStyle.Bold), ForeColor = Color.FromArgb(40, 43, 49), Bounds = new Rectangle(px(24), px(20), px(432), px(32)) };
             Controls.Add(heading);
-            string[] keyNames = { "左 Alt", "CapsLock", "左 Shift", "右 Shift" };
+            string[] keyNames = { "左 Alt", "CapsLock", "右 Alt", "右 Shift" };
             string[] actions = { "恢复拼音候选", "切换英文大小写", "提取中间内容 / 查词", "句首大写 / 标点转换" };
             for (int i = 0; i < keyNames.Length; i++) {
                 var row = new Panel { BackColor = Color.White, Bounds = new Rectangle(px(24), px(66 + i * 48), px(432), px(42)) };
@@ -532,14 +658,14 @@ namespace TextTransformer
                     bool down = msg == 0x100 || msg == 0x104;
                     int key = (int)data.vkCode;
                     if (down) {
-                        if (key == 0xA4) altAlone = !Native.Down(0x11) && !Native.Down(0x10) && !Native.Down(0x5B) && !Native.Down(0x5C);
+                        if (key == 0xA4 || key == 0xA5) altAlone = !Native.Down(0x11) && !Native.Down(0x10) && !Native.Down(0x5B) && !Native.Down(0x5C);
                         else altAlone = false;
                     }
-                    if (!down && key == 0xA4 && altAlone) {
+                    if (!down && (key == 0xA4 || key == 0xA5) && altAlone) {
                         try { Native.Key(0xE8); } catch (Exception ex) { ReportError(ex.Message); }
                         altAlone = false;
                     }
-                    bool modifiers = Native.Down(0x11) || Native.Down(0xA5) || (key != 0xA4 && Native.Down(0xA4)) || Native.Down(0x5B) || Native.Down(0x5C)
+                    bool modifiers = Native.Down(0x11) || (key != 0xA5 && Native.Down(0xA5)) || (key != 0xA4 && Native.Down(0xA4)) || Native.Down(0x5B) || Native.Down(0x5C)
                         || (key != 0xA0 && Native.Down(0xA0)) || (key != 0xA1 && Native.Down(0xA1));
                     var action = detector.Feed(key, down, Environment.TickCount & 0xFFFFFFFFL, modifiers);
                     if (action.HasValue) {
@@ -987,6 +1113,46 @@ namespace TextTransformer
                 FinishOperation(backup, ownedSequence, saved);
             }
         }
+        sealed class MultilineLookupPlan
+        {
+            public string Original, Line;
+            public Action Select;
+        }
+        static MultilineLookupPlan PlanMultilineLookup(IntPtr control)
+        {
+            Native.EditSnapshot snapshot;
+            if (Native.TryReadEdit(control, out snapshot)) {
+                if (snapshot.Start != snapshot.End || snapshot.Text.IndexOfAny(new[] { '\r', '\n' }) < 0) return null;
+                return new MultilineLookupPlan {
+                    Original = snapshot.Text, Line = LookupLine.Before(snapshot.Text, snapshot.Start),
+                    Select = delegate { Native.SelectEditText(control, 0, snapshot.Text.Length); }
+                };
+            }
+            var element = AutomationElement.FocusedElement;
+            for (int i = 0; element != null && i < 6; i++) {
+                if (element.Current.IsPassword) return null;
+                object value;
+                if (element.TryGetCurrentPattern(TextPattern.Pattern, out value)) {
+                    var pattern = (TextPattern)value;
+                    var ranges = pattern.GetSelection();
+                    if (ranges.Length != 1 || ranges[0].CompareEndpoints(TextPatternRangeEndpoint.Start, ranges[0], TextPatternRangeEndpoint.End) != 0) return null;
+                    string text = pattern.DocumentRange.GetText(-1);
+                    if (text.IndexOfAny(new[] { '\r', '\n' }) < 0) return null;
+                    if (text.Length > 1048576) throw new InvalidOperationException("全文超过自动读取范围，请手动选择要提取的内容。");
+                    var prefix = pattern.DocumentRange.Clone();
+                    prefix.MoveEndpointByRange(TextPatternRangeEndpoint.End, ranges[0], TextPatternRangeEndpoint.Start);
+                    string before = prefix.GetText(-1);
+                    if (!text.StartsWith(before, StringComparison.Ordinal)) throw new InvalidOperationException("无法确认当前行的位置，未修改内容。");
+                    return new MultilineLookupPlan {
+                        Original = text, Line = LookupLine.Before(text, before.Length),
+                        // The actual copied range must exactly match Original.
+                        Select = delegate { Native.Shortcut(0x41); }
+                    };
+                }
+                element = TreeWalker.ControlViewWalker.GetParent(element);
+            }
+            return null;
+        }
         async Task ConvertTarget(IntPtr target, ActionKind kind, IntPtr control = default(IntPtr))
         {
             expectedFocus = control == IntPtr.Zero ? Native.FocusedControl(target) : control;
@@ -1005,12 +1171,22 @@ namespace TextTransformer
                     throw new InvalidOperationException("无法确认文本选区，请在支持选区读取的编辑器中选中文字后重试。");
                 backup = await BackupForOperation(target); saved = true;
                 string original = null;
-                if (selectionState.Value) {
+                string lookupLine = null;
+                var multiline = kind == ActionKind.LettersOnly && !selectionState.Value && EditableFocus()
+                    ? PlanMultilineLookup(expectedFocus) : null;
+                if (multiline != null) {
+                    CheckTarget(target);
+                    multiline.Select(); temporarySelection = true;
+                    await Task.Delay(50);
+                    original = await CopyText(target, 3, text => PlainText.Same(text, multiline.Original), sequence => ownedSequence = sequence);
+                    if (!PlainText.Same(original, multiline.Original)) throw new InvalidOperationException("无法核对多行全文，未删除或替换内容。");
+                    lookupLine = multiline.Line;
+                } else if (selectionState.Value) {
                     original = await CopyText(target, 3, text => !String.IsNullOrEmpty(text), sequence => ownedSequence = sequence);
                 } else
                     original = await SelectSentenceSuffix(target, kind, selected => temporarySelection = selected, sequence => ownedSequence = sequence);
                 if (String.IsNullOrEmpty(original)) return;
-                string result = Transform.Apply(original, kind);
+                string result = Transform.Apply(lookupLine ?? original, kind);
                 if (kind == ActionKind.LettersOnly && !EditableFocus() && result.Length > 0) {
                     CheckTarget(target);
                     Clipboard.SetText(result);
@@ -1021,6 +1197,22 @@ namespace TextTransformer
                 if (result == original) return;
                 await Task.Delay(80); CheckTarget(target);
                 string beforePaste = ReadFocusedText(expectedFocus);
+                Native.EditSnapshot nativeReplacement;
+                if (Native.TryReadEdit(expectedFocus, out nativeReplacement)) {
+                    if (!PlainText.Same(nativeReplacement.Text.Substring(nativeReplacement.Start, nativeReplacement.End - nativeReplacement.Start), original))
+                        throw new InvalidOperationException("替换前的选区已改变，未修改文字。");
+                    string expected = nativeReplacement.Text.Substring(0, nativeReplacement.Start) + result
+                        + nativeReplacement.Text.Substring(nativeReplacement.End);
+                    CheckTarget(target);
+                    Native.ReplaceEditSelection(expectedFocus, result);
+                    temporarySelection = false;
+                    if (!await Compatibility.WaitUntil(delegate {
+                        Native.EditSnapshot after;
+                        return Native.TryReadEdit(expectedFocus, out after) && PlainText.Same(after.Text, expected);
+                    }, () => CheckTarget(target), 10, 50))
+                        throw new InvalidOperationException("未能确认原生输入框替换结果，请检查当前文字；程序未重复输入。");
+                    return;
+                }
                 // Empty text cannot be pasted; Delete removes exactly the selected text.
                 if (result.Length == 0) { Native.DeleteSelection(); temporarySelection = false; }
                 else {
@@ -1084,7 +1276,7 @@ namespace TextTransformer
             Require(cancelled && probes == 0, "Target changes must abort without retrying or typing");
             Require(Transform.Apply("Hello，世界!", ActionKind.ToggleCase) == "HELLO，世界!", "Case conversion regression");
             Require(Transform.Apply("ABC", ActionKind.ToggleCase) == "abc", "Lowercase conversion regression");
-            Require(Transform.Apply("a中B!123", ActionKind.LettersOnly) == "aB", "Letters-only regression");
+            Require(Transform.Apply("a中B!123", ActionKind.LettersOnly) == "B", "Mixed text must keep the nearest English run");
             Require(Transform.Apply("hELLO。wORLD！", ActionKind.SentenceCase) == "Hello.World!", "Sentence/punctuation regression");
             foreach (string value in new[] { "nihao", "NIHAO", "xi'an", "nihao'" }) Require(PinyinText.Valid(value), "Valid pinyin rejected");
             foreach (string value in new[] { "", "你好nihao", "hello nihao", "nihao\n", "abc123", "'abc", "a''b", new string('a', 65) }) Require(!PinyinText.Valid(value), "Unsafe pinyin accepted");
@@ -1127,9 +1319,9 @@ namespace TextTransformer
             Require(!taps.Feed(0xA4, false, 160, false).HasValue, "Alt+Tab must not trigger recovery");
             taps.Reset(); taps.Feed(0xA4, true, 0, false); taps.Feed(0xA4, false, 300, false); taps.Feed(0xA4, true, 350, false);
             Require(!taps.Feed(0xA4, false, 400, false).HasValue, "Long Alt hold must not count as a tap");
-            foreach (int key in new[] { 0x14, 0xA0, 0xA1 }) {
+            foreach (int key in new[] { 0x14, 0xA5, 0xA1 }) {
                 taps.Reset(); taps.Feed(key, true, 0, false); taps.Feed(key, false, 50, false); taps.Feed(key, true, 100, false);
-                Require(taps.Feed(key, false, 150, false) == (key == 0x14 ? ActionKind.ToggleCase : key == 0xA0 ? ActionKind.LettersOnly : ActionKind.SentenceCase), "Existing tap shortcut regression");
+                Require(taps.Feed(key, false, 150, false) == (key == 0x14 ? ActionKind.ToggleCase : key == 0xA5 ? ActionKind.LettersOnly : ActionKind.SentenceCase), "Existing tap shortcut regression");
             }
             Require(Marshal.SizeOf(typeof(Native.Input)) == (IntPtr.Size == 8 ? 40 : 28), "Native SendInput layout");
         }
